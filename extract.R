@@ -45,7 +45,8 @@ pdf_to_svg <- function(file_path) {
     "all"
   )
   exec_wait(command)
-  dir_ls(svg_dir)
+  # dir_ls(svg_dir)
+  list.files(svg_dir, full.names = TRUE)
 }
 
 #' Convert a string of coordinates to a tibble
@@ -429,3 +430,81 @@ write_tsv(
   final_region,
   paste0(max(final_region$report_date), "-region", ".tsv")
 )
+
+## AUS sub-regions
+
+df_country <- extract_country_urls(home_url) %>% 
+  filter(grepl("AU_Mobility", file_path))
+
+# Download the pdf files
+walk2(df_country$url, df_country$file_path, download_if_not_exists)
+
+# Convert to svg and extract the graphs
+df_au_state_trends <-
+  df_country %>% 
+  mutate(svg_path = map(file_path, pdf_to_svg)) %>% # convert pdf pages to svg
+  unnest(svg_path) %>%
+  mutate(page = as.integer(str_extract(svg_path, "[0-9]+(?=\\.pdf$)"))) %>%
+  mutate(type = if_else(page <= 2, "region", "sub-region")) %>%
+  mutate(geometry = map(svg_path, extract_geometry)) %>% # extract geometry from svg
+  unnest(geometry) %>%
+  group_by(url, page, row, col) %>%
+  mutate(group = cumsum(command == "M")) %>% # group sections of strokes
+  ungroup() %>%
+  select(-file_path, -svg_path, -command, -type)
+
+# Extract the text from the pdf
+df_au_state_text <-
+  df_country %>%
+  mutate(country_code = str_extract(url, "(?<=_)[A-Z]{2}(?=_)")) %>%
+  mutate(text = map(file_path, extract_text)) %>%
+  mutate(title = map(text, extract_title),
+         region_name = map_chr(title, extract_report_name),
+         report_date = do.call(c, map(title, extract_report_date))) %>%
+  select(-title) %>%
+  # Split the text into pages
+  mutate(text = map(text, nest_by, page, .key = "text")) %>%
+  unnest(text) %>%
+  mutate(type = if_else(page <= 2, "country", "region")) %>%
+  group_by(url) %>%
+  filter(page != max(page)) %>%        # Drop the final page, which is notes
+  ungroup() %>%
+  # Extract the panel subregion names, categories and baselines
+  rowwise() %>%
+  mutate(
+    sub_region_name = list(extract_region_names(type, text)),
+    category = list(extract_categories(type, page, text)),
+    baseline_comparison = list(extract_baseline_comparisons(type, text)),
+    panel = list(join_panels(sub_region_name, category, baseline_comparison))
+  ) %>%
+  ungroup() %>%
+  mutate(panel = map(panel, ~ rename(.x, sub_region_name = region_name))) %>%
+  select(url, page, country_code, region_name, report_date, type, panel) %>%
+  unnest(panel) %>%
+  select(url, page, country_code, region_name, report_date, type, row, col,
+         sub_region_name, category, baseline_comparison) %>%
+  mutate(type = as.character(fct_recode(as_factor(type),
+                                        `sub-region` = "region",
+                                        region = "country")))
+
+day_width_region <- extract_day_width(df_au_state_trends)
+
+# Pair up the text with the trends
+final_au_state <-
+  inner_join(df_au_state_text, df_au_state_trends,
+             by = c("url", "page", "row", "col")) %>%
+  group_by(url, page, row, col) %>%
+  arrange(url, page, row, col, x) %>%
+  mutate(
+    trend = scale_y(y, baseline, baseline_80),
+    date = x_to_date(x, baseline_x, report_date, day_width_region)
+  ) %>%
+  ungroup() %>%
+  select(-x, -y, -baseline, -baseline_80, -baseline_x)
+
+write_tsv(
+  final_au_state,
+  paste0(max(final_au_state$report_date), "-au_state", ".tsv")
+)
+
+
